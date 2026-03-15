@@ -1,0 +1,926 @@
+---
+title: "STA141A Final Project Report"
+subtitle: "Predicting Notable Wildfire Incidence in the United States"
+output: html_document
+author: 'Navid Rahimi'
+date: "March 16, 2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Abstract
+
+This report develops and evaluates binary classification models for predicting the monthly incidence of notable wildfires (≥ 300 acres) across U.S. states. Using 100,000 historical wildfire records spanning 1992–2015, we construct a state × year-month grid of 14,976 observations, with a positive-class rate of approximately 6%. The predictors, total small-fire count, mean small-fire size, and fraction of lightning-caused fires, are computed exclusively from fires below the 300-acre threshold to prevent target leakage. Exploratory analysis confirms a strong summer peak in fire activity, a modest upward trend over the study period, and a heavy geographic concentration in Western states. Two models are compared: a logistic regression baseline with explicit month and state fixed effects, and a random forest ensemble fitted with class-imbalance weighting. Both are evaluated by training on historical data and testing on future years across four successive time windows. Logistic regression achieves a pooled out-of-fold AUC of 0.900, outperforming the random forest (0.863) in every validation fold, reflecting the dominant role of regular seasonal and geographic structure in the prediction task.
+
+---
+
+## 1. Data Preprocessing
+
+### 1.1 Dataset Overview
+
+The raw dataset of 100,000 recorded observations is drawn from the *188 Million US Wildfires* database, spanning wildfire incidents recorded across the United States from **1992 to 2015**. Each row represents one fire event and includes the ignition location (latitude/longitude, state, county), discovery and containment dates, final burned area (acres), stated ignition cause, and land-ownership classification. In total the raw file contains **39 variables**.
+
+```{r include=FALSE, load-libraries-data}
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+
+# Load raw data
+wildfires_raw <- read_csv("wildfires_sample_100k.csv")
+
+nrow(wildfires_raw)
+ncol(wildfires_raw)
+min(wildfires_raw$FIRE_YEAR)
+max(wildfires_raw$FIRE_YEAR)
+"100,000 rows with 39 Columns"
+"Years Covered: 1992-2015"
+```
+
+------------------------------------------------------------------------
+
+### 1.2 Date Conversion
+
+`DISCOVERY_DATE` is stored as a JDN, and to extract the calendar year and month required for temporal aggregation we convert each JDN to an R `Date` object.
+
+```{r include=FALSE, date-conversion}
+wildfires_raw <- wildfires_raw %>%
+  mutate(
+    DISCOVERY_DT = as.Date(DISCOVERY_DATE - 2440587.5, origin = "1970-01-01"),
+    DISC_YEAR    = year(DISCOVERY_DT),
+    DISC_MONTH   = month(DISCOVERY_DT)
+  )
+
+# Spot-check: JDN 2453281.5 should map to 2004-10-03
+format(as.Date(2453281.5 - 2440587.5, origin = "1970-01-01"))
+```
+
+------------------------------------------------------------------------
+
+### 1.3 Missing-Data Assessment
+
+Before filtering or constructing the modeling dataset we need to check for missing values. Table 1 summarizes variables with at least one missing value.
+
+```{r echo=FALSE, missing-data-summary}
+missing_summary <- wildfires_raw %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(),
+               names_to  = "Variable",
+               values_to = "N_Missing") %>%
+  filter(N_Missing > 0) %>%
+  mutate(
+    Pct_Missing = paste0(round(100 * N_Missing / nrow(wildfires_raw), 1), "%")
+  ) %>%
+  arrange(desc(N_Missing))
+
+kable(
+  missing_summary,
+  caption    = "Table 1. Variables with missing values in the raw dataset (n = 100,000).",
+  col.names  = c("Variable", "N Missing", "% Missing"),
+  align      = "lrr"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "condensed"),
+    full_width        = FALSE
+  )
+```
+
+**Key observations and handling decisions:**
+
+-   **Administrative / reporting identifiers** (`FIRE_CODE`, `LOCAL_FIRE_REPORT_ID`, `ICS_209_*`, `MTBS_*`, `COMPLEX_NAME`) are missing in 50–100% of records. These fields describe reporting bureaucracy rather than fire characteristics and are **excluded** from all downstream analyses.
+-   **County-level geographic identifiers** (`COUNTY`, `FIPS_CODE`, `FIPS_NAME`) are absent for **\~36% of records**. This high rate motivates the use of U.S. *state* as the spatial unit (see Section 1.5).
+-   **`DISCOVERY_TIME`** (47% missing) and **`CONT_DATE`/`CONT_TIME`** (47–52% missing) are not used as predictors, avoiding substantial imputation.
+-   After applying these decisions the final modeling dataset contains **no missing values**.
+
+------------------------------------------------------------------------
+
+### 1.4 Notable-Fire Cutoff
+
+The size distribution of recorded fires is highly right-skewed: the median burned area is just **1 acre** and more than 85% of fires burned fewer than 10 acres. Including all fires in the prediction target would create extreme class imbalance and would conflate inconsequential ignitions, most of which self-extinguish or are immediately suppressed, with fires that are operationally and ecologically significant.
+
+To focus the prediction task on fires that matter, we filter the raw records to retain only fires with a final burned area **≥ 300 acres**. This threshold is chosen for the following reasons:
+
+1.  **Operational consistency.** U.S. fire-management agencies define *large wildland fires* as those burning ≥ 100 acres in timber fuel types or **≥ 300 acres in grass/brush fuel types**. Because the majority of large fires in this dataset occur in the grass and brush dominated landscapes of the Western states, the 300-acre standard is the most directly applicable benchmark.
+2.  **Meaningful class imbalance reduction.** At the state × month resolution adopted here (see Section 1.5–1.6), applying a 300-acre cutoff yields a positive-class rate of approximately 6%, which is challenging but easy to control for logistic regression style models.
+
+```{r include=FALSE, filter-notable}
+CUTOFF_ACRES <- 300
+
+notable <- wildfires_raw %>%
+  filter(FIRE_SIZE >= CUTOFF_ACRES)
+
+#Total fires in raw dataset
+nrow(wildfires_raw)
+#Notable fires (≥ 300 acres)
+nrow(notable)
+#Fraction retained
+round(100 * nrow(notable) / nrow(wildfires_raw), 2)
+
+# Size distribution context
+quantile(wildfires_raw$FIRE_SIZE,
+         probs = c(0.25, 0.50, 0.75, 0.90, 0.95, 0.99)) %>%
+  round(2) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+### 1.5 Spatial Unit
+
+We adopt the **U.S. state** as the spatial unit for three reasons:
+
+1.  **Data completeness.** State identifiers are present for all 100,000 raw records; county-level FIPS codes are missing for \~36%, which would require either exclusion or imputation of a large share of the data.
+2.  **Avoiding excessive sparsity.** At the county × month resolution there are roughly 3,100 counties × 12 months × 24 years ≈ 892,800 possible cells, the overwhelming majority of which would never contain a notable fire. Such extreme sparsity makes predictor aggregation unreliable and can destabilise model fitting.
+3.  **Operational interpretability.** U.S. wildfire management is coordinated at the state level through state forestry agencies and state-specific interagency coordination centers, making state-level predictions directly actionable.
+
+```{r include=FALSE, spatial-unit}
+valid_states <- wildfires_raw %>%
+  filter(!is.na(STATE)) %>%
+  pull(STATE) %>%
+  unique() %>%
+  sort()
+
+length(valid_states)
+paste(valid_states, collapse = ", ")
+```
+
+------------------------------------------------------------------------
+
+### 1.6 Space–Time Grid and Binary Outcome Variable
+
+The modeling dataset is formed by constructing a **complete state × year-month grid** spanning every combination of the 52 unique state codes, the 24 years (1992–2015), and all 12 calendar months, yielding **14,976 observations** (52 × 24 × 12).
+
+For each cell $(s, t)$ we define the binary outcome:
+
+$$Y_{s,t} = \mathbf{1}\!\left\{\text{at least one notable wildfire (FIRE\_SIZE} \geq 300 \text{ ac) was discovered in state } s \text{ during month } t\right\}$$
+
+Cells in which no notable fire was discovered receive $Y = 0$; cells containing at least one notable fire receive $Y = 1$.
+
+```{r include=FALSE, build-grid}
+years  <- min(wildfires_raw$FIRE_YEAR) : max(wildfires_raw$FIRE_YEAR)
+months <- 1:12
+
+# Complete state × year-month grid
+grid <- expand.grid(
+  STATE = valid_states,
+  YEAR  = years,
+  MONTH = months
+) %>%
+  as_tibble()
+
+# Aggregate notable fires per state-year-month
+notable_agg <- notable %>%
+  filter(!is.na(STATE), !is.na(DISC_YEAR), !is.na(DISC_MONTH)) %>%
+  group_by(STATE, YEAR = DISC_YEAR, MONTH = DISC_MONTH) %>%
+  summarise(fire_count = n(), .groups = "drop")
+
+# Join onto grid; cells with no notable fire get fire_count = 0
+modeling_data <- grid %>%
+  left_join(notable_agg, by = c("STATE", "YEAR", "MONTH")) %>%
+  mutate(
+    fire_count   = replace_na(fire_count, 0L),
+    notable_fire = as.integer(fire_count > 0)   # binary outcome variable
+  )
+
+nrow(modeling_data)
+    ncol(modeling_data)
+#Positive class  (Y = 1)
+sum(modeling_data$notable_fire)
+#Negative class  (Y = 0)
+sum(modeling_data$notable_fire == 0)
+#Positive rate
+round(100 * mean(modeling_data$notable_fire), 2)
+```
+
+------------------------------------------------------------------------
+
+### 1.7 Predictor Construction
+
+We construct three predictor variables by aggregating **small fires only** (FIRE\_SIZE < 300 acres) within each state × year-month cell. Critically, notable fires (≥ 300 acres) are excluded from predictor computation. Including them would constitute **target leakage**: a cell in which a notable fire occurs (Y = 1) would have an inflated `mean_fire_size` driven by the very fires that define the positive outcome, making the predictor almost perfectly correlated with the label and producing false high AUC values. Using only small fires provides a clean signal about background fire-weather conditions and ignition pressure without encoding the outcome.
+
+| Predictor | Description | Rationale |
+|:-----------------------|:-----------------------|:-----------------------|
+| `total_fires` | Count of small fires (< 300 ac) in the state-month | Captures overall ignition pressure and reporting effort without leaking the outcome |
+| `mean_fire_size` | Mean burned area (acres) across small fires | Reflects average fuel / burn conditions independent of notable-fire occurrence |
+| `pct_lightning` | Proportion of small fires attributed to lightning | Lightning-driven fires cluster spatially and seasonally with large-fire risk |
+
+State-month cells for which no small fire was recorded receive predictor values of zero.
+
+```{r include=FALSE, construct-predictors}
+predictors <- wildfires_raw %>%
+  filter(!is.na(STATE), !is.na(DISC_YEAR), !is.na(DISC_MONTH),
+         FIRE_SIZE < CUTOFF_ACRES) %>%           # exclude notable fires to prevent target leakage
+  group_by(STATE, YEAR = DISC_YEAR, MONTH = DISC_MONTH) %>%
+  summarise(
+    total_fires    = n(),
+    mean_fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+    pct_lightning  = mean(STAT_CAUSE_DESCR == "Lightning", na.rm = TRUE),
+    .groups        = "drop"
+  )
+
+modeling_data <- modeling_data %>%
+  left_join(predictors, by = c("STATE", "YEAR", "MONTH")) %>%
+  mutate(
+    total_fires    = replace_na(total_fires,    0),
+    mean_fire_size = replace_na(mean_fire_size, 0),
+    pct_lightning  = replace_na(pct_lightning,  0)
+  )
+
+# Confirm no missing values remain
+#Missing values in final modeling dataset
+colSums(is.na(modeling_data)) %>% print()
+```
+
+------------------------------------------------------------------------
+
+### 1.8 Final Dataset Summary
+
+Table 2 provides a concise description of the modeling dataset used in all subsequent analyses.
+
+```{r echo=FALSE, dataset-summary-table}
+summary_tbl <- tibble(
+  Attribute = c(
+    "Total observations",
+    "Spatial unit",
+    "Number of spatial units",
+    "Temporal unit",
+    "Year range",
+    "Months per year",
+    "Positive class  (Y = 1: notable fire occurred)",
+    "Negative class  (Y = 0: no notable fire)",
+    "Positive rate",
+    "Predictors",
+    "Missing values in final dataset",
+    "Notable-fire cutoff (FIRE_SIZE threshold)"
+  ),
+  Value = c(
+    format(nrow(modeling_data), big.mark = ","),
+    "U.S. State",
+    as.character(length(valid_states)),
+    "Calendar month",
+    paste(min(years), "–", max(years)),
+    "12",
+    format(sum(modeling_data$notable_fire),        big.mark = ","),
+    format(sum(modeling_data$notable_fire == 0),   big.mark = ","),
+    paste0(round(100 * mean(modeling_data$notable_fire), 2), "%"),
+    "total_fires, mean_fire_size, pct_lightning",
+    "None",
+    "≥ 300 acres"
+  )
+)
+
+kable(
+  summary_tbl,
+  caption   = "Table 2. Summary of the final modeling dataset.",
+  col.names = c("Attribute", "Value"),
+  align     = "lr"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = FALSE
+  ) %>%
+  row_spec(0, bold = TRUE)
+```
+
+------------------------------------------------------------------------
+
+## 2. Exploratory Data Analysis
+
+The goal of this section is to build intuition about the structure of notable wildfire incidence. It looks at its seasonality, geographic concentration, and relationship to the predictors constructed in Section 1, and uses those patterns to motivate the modeling decisions made in subsequent sections.
+
+------------------------------------------------------------------------
+
+### 2.1 Temporal Patterns
+
+#### 2.1.1 Seasonality
+
+```{r include=FALSE, eda-monthly-prep}
+# Compute the positive rate (proportion of state-year cells with a notable fire)
+# for each calendar month, averaged across all states and years
+monthly_summary <- modeling_data %>%
+  group_by(MONTH) %>%
+  summarise(
+    pos_rate  = mean(notable_fire),
+    n_pos     = sum(notable_fire),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    month_label = factor(month.abb[MONTH], levels = month.abb),
+    overall_avg = mean(modeling_data$notable_fire)
+  )
+```
+
+Figure 1 shows the average monthly probability that a state experiences at least one notable wildfire, aggregated across all states and all years from 1992 to 2015. The pattern reveals a pronounced **summer peak**: August has the highest positive rate (12.7%), followed closely by July (11.6%) and June (10.0%), while December is the quietest month at just 1.1% which is an **11-fold difference** between the most and least active months. A secondary elevation in spring (March–April, ~7–8%) reflects the Southern Plains fire season driven by dry grassland conditions before vegetation greens up.
+
+```{r echo=FALSE, fig.width=8, fig.height=4, fig.align='center', eda-monthly-plot}
+ggplot(monthly_summary, aes(x = month_label, y = pos_rate * 100)) +
+  geom_col(aes(fill = pos_rate), width = 0.75, show.legend = FALSE) +
+  geom_hline(aes(yintercept = overall_avg * 100),
+             linetype = "dashed", color = "darkgrey", linewidth = 0.6) +
+  annotate("text", x = 1, y = mean(modeling_data$notable_fire) * 100 + 0.5,
+           label = "Overall average", hjust = 0, size = 3, color = "darkgrey") +
+  scale_fill_gradient(low = "#fde68a", high = "#b91c1c") +
+  scale_y_continuous(labels = function(x) paste0(x, "%"),
+                     expand  = expansion(mult = c(0, 0.08))) +
+  labs(
+    title   = "Figure 1. Monthly probability of notable wildfire occurrence",
+    subtitle = "Proportion of state–year cells with at least one fire ≥ 300 acres, averaged 1992–2015",
+    x = NULL,
+    y = "Positive rate (%)"
+  ) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, color = "darkgrey"),
+    panel.grid.major.x = element_blank(),
+    axis.text.x   = element_text(size = 10)
+  )
+```
+
+**What This Model Suggests:** The strong monthly seasonality justifies including calendar month as a predictor. A model that ignores month would systematically underestimate fire probability in summer and overestimate it in winter.
+
+------------------------------------------------------------------------
+
+#### 2.1.2 Year-over-Year Trend
+
+```{r include=FALSE, eda-annual-prep}
+annual_summary <- modeling_data %>%
+  group_by(YEAR) %>%
+  summarise(
+    n_fires  = sum(notable_fire),
+    pos_rate = mean(notable_fire),
+    .groups  = "drop"
+  )
+```
+
+Figure 2 plots the total number of state–month cells recording a notable fire in each year. The series fluctuates considerably, ranging from a low of 13 cells in 1997 to a high of 64 in 2006, but displays a modest upward trend. The average annual count in the early period (1992–2003) was 34 active cells per year, compared with 42 in the later period (2004–2015), consistent with documented increases in large-fire frequency attributed to warming temperatures and prolonged drought conditions across the Western United States.
+
+```{r echo=FALSE, fig.width=9, fig.height=4, fig.align='center', eda-annual-plot}
+ggplot(annual_summary, aes(x = YEAR, y = n_fires)) +
+  geom_line(color = "darkorange", linewidth = 1) +
+  geom_point(color = "darkorange", size = 2.5) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue",
+              fill = "skyblue", linewidth = 0.8, alpha = 0.35) +
+  scale_x_continuous(breaks = seq(1992, 2015, by = 3)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  labs(
+    title    = "Figure 2. Annual count of state–months with a notable wildfire (1992–2015)",
+    subtitle = "Blue band shows linear trend with 95% confidence interval",
+    x        = "Year",
+    y        = "Number of active state–month cells"
+  ) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, color = "grey30"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**What This Model Suggests** The positive linear trend suggests that year carries predictive signal independent of seasonal patterns. Including `YEAR` as a covariate allows the model to account for this slow-moving, climate-driven baseline shift in fire risk.
+
+------------------------------------------------------------------------
+
+### 2.2 Spatial Distribution of Notable Fires
+
+```{r include=FALSE, eda-spatial-prep}
+library(maps)
+
+# Aggregate total notable fires per state over the full study period
+fire_by_state <- notable %>%
+  filter(!is.na(STATE)) %>%
+  count(STATE, name = "n_notable") %>%
+  arrange(desc(n_notable))
+
+# Build a lookup from 2-letter abbreviation to lowercase full name
+# (used to join onto ggplot2's built-in map data)
+state_lookup <- tibble(
+  STATE  = c(state.abb, "DC"),
+  region = tolower(c(state.name, "district of columbia"))
+)
+
+fire_by_state_map <- state_lookup %>%
+  left_join(fire_by_state, by = "STATE") %>%
+  mutate(n_notable = replace_na(n_notable, 0))
+
+us_map <- map_data("state") %>%
+  left_join(fire_by_state_map, by = "region")
+```
+
+Figure 3 maps the total number of notable wildfires (≥ 300 acres) recorded in each contiguous U.S. state over the 24-year study period (Alaska and Hawaii are excluded from the map but included in the model). Fire incidence is heavily concentrated in a Western arc: **Texas** leads with 155 notable fires, followed by **California** (118), **Idaho** (101), **Oklahoma** (89), and **New Mexico** (82). Together these five states account for roughly 40% of all notable fire occurrences in the sample despite representing a fraction of the total state–months in the modeling grid.
+
+```{r echo=FALSE, fig.width=10, fig.height=5.5, fig.align='center', eda-spatial-plot}
+ggplot(us_map, aes(x = long, y = lat, group = group, fill = n_notable)) +
+  geom_polygon(color = "white", linewidth = 0.25) +
+  coord_fixed(1.3) +
+  scale_fill_gradient(
+    low      = "#fef9c3",
+    high     = "#7f1d1d",
+    na.value = "grey85",
+    name     = "Notable fires\n(1992–2015)"
+  ) +
+  labs(
+    title    = "Figure 3. Total notable wildfires (≥ 300 acres) per state, 1992–2015",
+    subtitle = "Contiguous U.S. only. Alaska (83 fires) and Hawaii are excluded from the map."
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 12, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey30", hjust = 0.5),
+    legend.position = "right"
+  )
+```
+
+**What This Model Suggests** The strong geographic concentration of fire activity means that state identity is a powerful predictor on its own. Models should incorporate spatial information, either through state fixed effects or through state-level summary features, to capture this persistent spatial heterogeneity.
+
+------------------------------------------------------------------------
+
+### 2.3 Predictor Distributions by Outcome
+
+```{r include=FALSE, eda-predictor-prep}
+# Reshape modeling_data to long format for faceted plots
+# Log-transform total_fires and mean_fire_size to reduce right-skew
+predictor_long <- modeling_data %>%
+  mutate(
+    Outcome          = if_else(notable_fire == 1, "Fire (Y = 1)", "No fire (Y = 0)"),
+    log_total_fires  = log1p(total_fires),
+    log_mean_size    = log1p(mean_fire_size)
+  ) %>%
+  select(Outcome, log_total_fires, log_mean_size, pct_lightning) %>%
+  pivot_longer(
+    cols      = c(log_total_fires, log_mean_size, pct_lightning),
+    names_to  = "Predictor",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Predictor = recode(Predictor,
+      log_total_fires = "log(1 + total_fires)",
+      log_mean_size   = "log(1 + mean_fire_size)",
+      pct_lightning   = "pct_lightning"
+    )
+  )
+```
+
+Figure 4 compares the distribution of each predictor across fire (Y = 1) and no-fire (Y = 0) state–month cells using violin plots overlaid with box plots. `total_fires` and `mean_fire_size` are log-transformed to reduce right-skew and improve readability; `pct_lightning` is shown on its original [0, 1] scale.
+
+```{r echo=FALSE, fig.width=9.5, fig.height=4.5, fig.align='center', eda-predictor-plot}
+ggplot(predictor_long,
+       aes(x = Outcome, y = Value, fill = Outcome)) +
+  geom_violin(trim = TRUE, alpha = 0.4, linewidth = 0.3) +
+  geom_boxplot(width = 0.2, outlier.size = 0.6,
+               outlier.alpha = 0.3, linewidth = 0.4,
+               fill = "white", alpha = 0.8) +
+  facet_wrap(~ Predictor, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c("Fire (Y = 1)" = "red",
+                               "No fire (Y = 0)" = "steelblue")) +
+  labs(
+    title    = "Figure 4. Predictor distributions for fire vs. no-fire state–month cells",
+    subtitle = "total_fires and mean_fire_size are log(1 + x) transformed",
+    x        = NULL,
+    y        = "Value",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 10, color = "grey30"),
+    legend.position  = "bottom",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+All three predictors show clear separation between classes. In fire-active cells, `total_fires` has a median of 18 versus 1 in no-fire cells (a **5× difference in means**); `mean_fire_size` has a median nearly 750× larger (89 acres vs. 0.12 acres); and `pct_lightning` is substantially elevated, with a median of 0.11 in fire cells versus 0 in no-fire cells. The right tails of the fire distributions are particularly heavy, reflecting the handful of state–months with extreme fire activity.
+
+**What This Model Suggests** The strong distributional separation across all three predictors confirms that they carry genuine predictive signal and are worth including in both the baseline and the candidate model. The log-scale separation in `total_fires` and `mean_fire_size` also suggests that these variables may benefit from a log transformation (or that a tree-based model, which splits on raw values, may handle them more naturally than a linear model on the original scale).
+
+------------------------------------------------------------------------
+
+## 3. Modeling
+
+Two binary classification models are specified and fitted in this section. Both models share the same six-predictor input space to ensure a fair performance comparison in Section 4. The baseline model is a logistic regression, which serves as a simple and interpretable benchmark. The model of choice is a random forest, selected on the basis of the non-linear, skewed, and interaction-rich structure revealed by the EDA in Section 2.
+
+------------------------------------------------------------------------
+
+### 3.1 Baseline Model: Logistic Regression
+
+Logistic regression models the log-odds of the binary outcome as a linear combination of predictors. For each state–month cell $(s, t)$, the model is:
+
+$$\text{logit}\!\left[P(Y_{s,t}=1)\right] = \beta_0 + \beta_1\,\text{YEAR} + \sum_{m=2}^{12}\alpha_m\,\mathbf{1}[\text{MONTH}=m] + \sum_{j=2}^{52}\gamma_j\,\mathbf{1}[\text{STATE}=j] + \beta_2\,\log(1+\text{total\_fires}) + \beta_3\,\log(1+\text{mean\_fire\_size}) + \beta_4\,\text{pct\_lightning}$$
+
+The model has **67 free parameters**: an intercept, a slope for `YEAR`, eleven month indicators (January as reference), fifty-one state indicators (Alaska as reference), and three slopes for the continuous predictors.
+
+The continuous predictors `total_fires` and `mean_fire_size` enter on a $\log(1+x)$ scale, motivated by Section 2.3, which showed their distributions to be heavily right-skewed; the log transformation brings them closer to linearity in log-odds space. `pct_lightning` is already bounded on $[0,1]$ and enters untransformed. Month and state fixed effects are included as indicator variables, directly capturing the seasonal and geographic heterogeneity identified in Sections 2.1 and 2.2.
+
+The predicted probability for a new observation is recovered by the inverse logit:
+
+$$\hat{P}(Y_{s,t}=1) = \frac{1}{1 + e^{-\hat{\eta}_{s,t}}}$$
+
+where $\hat{\eta}_{s,t}$ is the estimated linear predictor.
+
+```{r include=FALSE, lr-prep}
+# Add log-transformed continuous predictors
+modeling_data <- modeling_data %>%
+  mutate(
+    log_total_fires    = log1p(total_fires),
+    log_mean_fire_size = log1p(mean_fire_size)
+  )
+```
+
+```{r include=FALSE, fit-baseline}
+lr_model <- glm(
+  notable_fire ~ YEAR + factor(MONTH) + factor(STATE) +
+                 log_total_fires + log_mean_fire_size + pct_lightning,
+  data   = modeling_data,
+  family = binomial(link = "logit")
+)
+
+summary(lr_model)
+```
+
+------------------------------------------------------------------------
+
+### 3.2 Model of Choice: Random Forest
+
+A random forest is an ensemble of $B$ binary decision trees. Each tree $T_b$ is grown on a bootstrap sample of the training data, and at every candidate split only a random subset of $m$ predictors is considered. The predicted fire probability for a new observation $\mathbf{x}$ is the average of the individual tree probability estimates:
+
+$$\hat{P}(Y_{s,t}=1 \mid \mathbf{x}) = \frac{1}{B}\sum_{b=1}^{B} T_b(\mathbf{x};\,\Theta_b)$$
+
+where $\Theta_b$ encodes the bootstrap sample indices and the random feature subset drawn at each split of tree $b$. Key hyperparameter choices are as follows:
+
+- **Number of trees ($B$):** 500. Sufficient for stable probability estimates with negligible variance from the randomisation; increasing beyond 500 provides diminishing returns.
+- **Features per split ($m$):** $\lfloor\sqrt{p}\rfloor = \lfloor\sqrt{6}\rfloor = 2$. The standard default for classification, ensuring that each tree uses a diverse, decorrelated subset of predictors.
+- **Class weights:** The positive class ($Y=1$) is upweighted by a factor of $14{,}066 / 910 \approx 15.5$ to compensate for the 15:1 class imbalance, preventing the ensemble from defaulting to the majority class.
+
+**Justification.** Three specific findings from the EDA directly motivate the choice of random forest over logistic regression:
+
+1. *Non-linearity and skewness.* The violin plots in Figure 4 show that `total_fires` and `mean_fire_size` have extreme right-skewed distributions with qualitatively different shapes between classes. Decision trees split on raw threshold values and are insensitive to monotone transformations of predictors, making log-transformation unnecessary.
+2. *Interactions.* Fire risk is inherently interactive — a high `pct_lightning` is far more dangerous in a dry Western state in August than in a humid Eastern state in February. Random forests discover such interactions automatically through consecutive splits in individual trees, without requiring manual feature engineering.
+3. *High-cardinality categorical predictors.* With 52 states and 12 months, the predictor space has strong categorical structure. Random forests handle categorical variables natively through optimal or random-subset splitting strategies, whereas a linear model requires 62 indicator variables and becomes sensitive to multicollinearity among them.
+
+
+```{r include=FALSE, rf-prep}
+# The model is implemented using the ranger package, which I chose for its efficient handling of the 52-level STATE factor.
+library(ranger)
+
+# Prepare dataset: convert outcome and categoricals to factors
+rf_data <- modeling_data %>%
+  mutate(
+    notable_fire = factor(notable_fire, levels = c(0, 1), labels = c("no", "yes")),
+    MONTH        = factor(MONTH),
+    STATE        = factor(STATE)
+  )
+
+# Class weight: upweight the rare positive class proportionally to imbalance
+n_neg <- sum(modeling_data$notable_fire == 0)
+n_pos <- sum(modeling_data$notable_fire == 1)
+w_pos <- n_neg / n_pos   # ≈ 15.5
+```
+
+```{r include=FALSE, fit-rf}
+set.seed(141)
+rf_model <- ranger(
+  formula       = notable_fire ~ YEAR + MONTH + STATE +
+                                 total_fires + mean_fire_size + pct_lightning,
+  data          = rf_data,
+  num.trees     = 500,
+  mtry          = 2,
+  probability   = TRUE,
+  class.weights = c("no" = 1, "yes" = w_pos),
+  importance    = "impurity",
+  seed          = 141
+)
+
+rf_model
+```
+
+------------------------------------------------------------------------
+
+### 3.3 Model Specification Summary
+
+Table 3 summarises the key design decisions for both models side by side.
+
+```{r echo=FALSE, model-spec-table}
+spec_tbl <- tibble(
+  Attribute = c(
+    "Model type",
+    "Outcome",
+    "Predictors",
+    "Continuous predictor encoding",
+    "Spatial / temporal structure",
+    "Class imbalance handling",
+    "Key hyperparameters",
+    "Free parameters",
+    "Interpretability"
+  ),
+  `Logistic Regression` = c(
+    "Generalised linear model (binomial)",
+    "Binary: notable_fire (0 / 1)",
+    "YEAR, MONTH, STATE, log_total_fires, log_mean_fire_size, pct_lightning",
+    "log(1 + x) transformation applied",
+    "Explicit indicator variables (11 month + 51 state dummies)",
+    "None required",
+    "None (MLE via IRLS)",
+    "67",
+    "High — signed coefficients on log-odds scale"
+  ),
+  `Random Forest` = c(
+    "Ensemble of 500 decision trees (ranger)",
+    "Binary: notable_fire (no / yes)",
+    "YEAR, MONTH, STATE, total_fires, mean_fire_size, pct_lightning",
+    "Raw values (no transformation needed)",
+    "Learned implicitly through tree splits",
+    "Positive-class weight ≈ 15.5×",
+    "B = 500 trees, mtry = 2, class weight = 15.5",
+    "Non-parametric",
+    "Moderate — variable importance scores available"
+  )
+)
+
+kable(
+  spec_tbl,
+  caption   = "Table 3. Specification summary for both predictive models.",
+  col.names = c("Attribute", "Logistic Regression", "Random Forest"),
+  align     = "lll"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE
+  ) %>%
+  row_spec(0, bold = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "22em")
+```
+
+------------------------------------------------------------------------
+
+## 4. Model Fitting and Validation
+
+Both models are evaluated using **time-series cross-validation**, the only validation strategy that fully respects the temporal ordering of the data. In each fold the model is trained exclusively on years prior to the test window, so predictions are always made into the future relative to training. Standard k-fold cross-validation is not used here because randomly shuffling observations into folds would allow the model to train on, say, 2014 data and test on 1998 data, producing an optimistic AUC estimate that does not reflect real-world deployment conditions.
+
+The 24 available years are partitioned into four folds with a fixed 2-year test window:
+
+| Fold | Training years | Test years |
+|:---:|:---|:---|
+| 1 | 1992 – 2007 | 2008 – 2009 |
+| 2 | 1992 – 2009 | 2010 – 2011 |
+| 3 | 1992 – 2011 | 2012 – 2013 |
+| 4 | 1992 – 2013 | 2014 – 2015 |
+
+At each fold both models are re-fitted from scratch on the training subset and scored on the held-out test subset. Out-of-fold predicted probabilities are collected across all four folds and used to compute per-fold AUC, an overall (pooled) AUC, and the ROC curves shown in Figures 5 and 6.
+
+```{r include=FALSE, cv-setup}
+library(pROC)
+
+# Define the four expanding-window folds
+folds <- list(
+  list(train = 1992:2007, test = 2008:2009, label = "2008-2009"),
+  list(train = 1992:2009, test = 2010:2011, label = "2010-2011"),
+  list(train = 1992:2011, test = 2012:2013, label = "2012-2013"),
+  list(train = 1992:2013, test = 2014:2015, label = "2014-2015")
+)
+```
+
+```{r include=FALSE, cv-loop}
+# Run walk-forward CV; collect raw predictions for pooled ROC + per-fold AUC
+cv_preds <- map_dfr(seq_along(folds), function(i) {
+
+  f         <- folds[[i]]
+  train_dat <- modeling_data %>% filter(YEAR %in% f$train)
+  test_dat  <- modeling_data %>% filter(YEAR %in% f$test)
+
+  # Logistic Regression
+  lr_fit  <- glm(
+    notable_fire ~ YEAR + factor(MONTH) + factor(STATE) +
+                   log_total_fires + log_mean_fire_size + pct_lightning,
+    data   = train_dat,
+    family = binomial(link = "logit")
+  )
+  lr_prob <- predict(lr_fit, newdata = test_dat, type = "response")
+
+  # Random Forest
+  # Encode factors with levels anchored to the training fold
+  month_lvls <- levels(factor(train_dat$MONTH))
+  state_lvls <- levels(factor(train_dat$STATE))
+
+  rf_train <- train_dat %>%
+    mutate(
+      notable_fire = factor(notable_fire, levels = c(0, 1), labels = c("no", "yes")),
+      MONTH        = factor(MONTH, levels = month_lvls),
+      STATE        = factor(STATE, levels = state_lvls)
+    )
+  rf_test <- test_dat %>%
+    mutate(
+      MONTH = factor(MONTH, levels = month_lvls),
+      STATE = factor(STATE, levels = state_lvls)
+    )
+
+  rf_fit  <- ranger(
+    formula       = notable_fire ~ YEAR + MONTH + STATE +
+                                   total_fires + mean_fire_size + pct_lightning,
+    data          = rf_train,
+    num.trees     = 500,
+    mtry          = 2,
+    probability   = TRUE,
+    class.weights = c("no" = 1, "yes" = w_pos),
+    seed          = 141
+  )
+  rf_prob <- predict(rf_fit, data = rf_test)$predictions[, "yes"]
+
+  tibble(
+    fold    = i,
+    label   = f$label,
+    actual  = test_dat$notable_fire,
+    lr_prob = lr_prob,
+    rf_prob = rf_prob
+  )
+})
+```
+
+```{r include=FALSE, cv-auc-calc}
+# Per-fold AUC
+cv_auc <- cv_preds %>%
+  group_by(fold, label) %>%
+  summarise(
+    lr_auc = as.numeric(auc(roc(actual, lr_prob, quiet = TRUE))),
+    rf_auc = as.numeric(auc(roc(actual, rf_prob, quiet = TRUE))),
+    .groups = "drop"
+  )
+
+# Overall (pooled) AUC across all four test folds
+overall_lr <- as.numeric(auc(roc(cv_preds$actual, cv_preds$lr_prob, quiet = TRUE)))
+overall_rf <- as.numeric(auc(roc(cv_preds$actual, cv_preds$rf_prob, quiet = TRUE)))
+```
+
+------------------------------------------------------------------------
+
+### 4.1 Cross-Validated AUC by Fold
+
+Table 4 reports the held-out AUC for both models in each test period, along with the overall pooled AUC. The pooled AUC treats the four test windows as one continuous held-out set and is the primary summary metric.
+
+```{r echo=FALSE, cv-auc-table}
+auc_tbl <- cv_auc %>%
+  mutate(
+    improvement = lr_auc - rf_auc,
+    lr_auc      = round(lr_auc, 3),
+    rf_auc      = round(rf_auc, 3),
+    improvement = round(improvement, 3)
+  ) %>%
+  select(label, lr_auc, rf_auc, improvement)
+
+# Append overall row
+auc_tbl <- bind_rows(
+  auc_tbl,
+  tibble(
+    label       = "Overall (pooled)",
+    lr_auc      = round(overall_lr, 3),
+    rf_auc      = round(overall_rf, 3),
+    improvement = round(overall_lr - overall_rf, 3)
+  )
+)
+
+kable(
+  auc_tbl,
+  caption   = "Table 4. Cross-validated AUC by test period for both models.",
+  col.names = c("Test period", "Logistic Regression", "Random Forest", "LR - RF"),
+  align     = "lccc"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = FALSE
+  ) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(nrow(auc_tbl), bold = TRUE, background = "lightgray")
+```
+
+------------------------------------------------------------------------
+
+### 4.2 Diagnostic Plots
+
+#### 4.2.1 Cross-Validated AUC Over Time
+
+Figure 5 plots the per-fold AUC for both models across the four test periods. The dashed line marks the AUC of a random classifier (0.5). Logistic regression achieves higher AUC than the random forest in every fold (pooled AUC 0.900 vs. 0.863), a result that is consistent with the structure of this dataset: the space–time grid has strong and regular seasonal and geographic patterns that the explicit month and state fixed effects in the logistic model capture very efficiently. Both models show some fold-to-fold variation, which reflects the inter-annual variability in fire activity documented in Figure 2.
+
+```{r echo=FALSE, fig.width=8, fig.height=4.5, fig.align='center', cv-auc-plot}
+fold_labels <- map_chr(folds, "label")
+
+cv_auc_long <- cv_auc %>%
+  pivot_longer(
+    cols      = c(lr_auc, rf_auc),
+    names_to  = "model",
+    values_to = "auc"
+  ) %>%
+  mutate(
+    model = recode(model,
+      lr_auc = "Logistic Regression",
+      rf_auc = "Random Forest"
+    ),
+    label = factor(label, levels = fold_labels)
+  )
+
+ggplot(cv_auc_long, aes(x = label, y = auc, color = model, group = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3.5) +
+  geom_hline(yintercept = 0.5, linetype = "dashed",
+             color = "grey", linewidth = 0.6) +
+  annotate("text", x = 0.65, y = 0.515,
+           label = "Random classifier", hjust = 0, size = 3, color = "grey") +
+  scale_color_manual(values = c(
+    "Logistic Regression" = "steelblue",
+    "Random Forest"       = "darkorange"
+  )) +
+  scale_y_continuous(
+    limits = c(0.5, 1.0),
+    breaks = seq(0.5, 1.0, by = 0.1)
+  ) +
+  labs(
+    title    = "Figure 5. Cross-validated AUC by test period",
+    subtitle = "Time-series Cross-validation; each point is one held-out test AUC",
+    x        = "Test period",
+    y        = "AUC",
+    color    = NULL
+  ) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 10, color = "darkgrey"),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+------------------------------------------------------------------------
+
+#### 4.2.2 ROC Curves (Pooled Out-of-Fold Predictions)
+
+Figure 6 shows the ROC curves for both models, built from the pooled out-of-fold predicted probabilities across all four test windows. Each point on a curve corresponds to a different classification threshold; the area under the curve summarises overall discrimination across all thresholds. A perfect classifier would trace the upper-left corner while the dashed diagonal represents chance. The logistic regression curve sits above the random forest curve across most of the false-positive rate range, consistent with its higher pooled AUC (0.900 vs. 0.863). This outcome reflects the strong regularities in the data, pronounced seasonal cycles, and persistent state-level differences, that linear fixed effects capture concisely and reliably when generalizing to future time periods.
+
+```{r echo=FALSE, fig.width=7, fig.height=5.5, fig.align='center', cv-roc-plot}
+roc_lr <- roc(cv_preds$actual, cv_preds$lr_prob, quiet = TRUE)
+roc_rf <- roc(cv_preds$actual, cv_preds$rf_prob, quiet = TRUE)
+
+roc_df <- bind_rows(
+  tibble(
+    model       = paste0("Logistic Regression (AUC = ", round(overall_lr, 3), ")"),
+    fpr         = 1 - roc_lr$specificities,
+    sensitivity = roc_lr$sensitivities
+  ),
+  tibble(
+    model       = paste0("Random Forest (AUC = ", round(overall_rf, 3), ")"),
+    fpr         = 1 - roc_rf$specificities,
+    sensitivity = roc_rf$sensitivities
+  )
+)
+
+model_colors <- setNames(
+  c("steelblue", "darkorange"),
+  c(paste0("Logistic Regression (AUC = ", round(overall_lr, 3), ")"),
+    paste0("Random Forest (AUC = ", round(overall_rf, 3), ")"))
+)
+
+ggplot(roc_df, aes(x = fpr, y = sensitivity, color = model)) +
+  geom_line(linewidth = 1.1) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey", linewidth = 0.6) +
+  scale_color_manual(values = model_colors) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Figure 6. ROC curves — pooled out-of-fold predictions (2008–2015)",
+    subtitle = "Predictions pooled across all four walk-forward test windows",
+    x        = "False positive rate (1 - Specificity)",
+    y        = "True positive rate (Sensitivity)",
+    color    = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 10, color = "darkgrey"),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+---
+
+
+## 5. Summary
+
+### 5.1 Key Findings from Exploratory Analysis
+
+The exploratory analysis revealed three dominant patterns in the historical wildfire record. First, wildfire incidence is strongly seasonal: the probability that a U.S. state experiences at least one notable fire peaks in August (12.7%) and reaches its lowest in December (1.1%), an eleven-fold difference. A secondary spring elevation in March–April reflects the Southern Plains dry-grass fire season. Second, fire activity is highly concentrated geographically. Five Western and Southern states (Texas, California, Idaho, Oklahoma, and New Mexico) account for roughly 40% of all notable fire occurrences despite representing a small fraction of the state-month grid. This persistent spatial heterogeneity indicates that a model must account for state-level baseline differences. Third, a modest but consistent upward trend is visible over the study period: the average number of active state-month cells per year rose from 34 (1992–2003) to 42 (2004–2015), consistent with documented increases in large-fire frequency linked to warming temperatures and prolonged drought.
+
+The predictor distributions reinforce these patterns. State-month cells that contain a notable fire have substantially higher counts of small fires, larger average small-fire sizes, and a higher proportion of ignitions caused by lightning compared with non-fire cells. This separation across all three predictors confirms that background fire activity and ignition type carry genuine predictive signal about the likelihood of a notable fire in a given place and time.
+
+### 5.2 What the Predictive Models Capture
+
+Both models, logistic regression and random forest, are able to translate these patterns into meaningful out-of-sample discrimination. The logistic regression achieves a pooled AUC of 0.900 across four walk forward validation folds, and the random forest achieves 0.863. An AUC well above 0.5 means that, when randomly pairing a state-month that did experience a notable fire with one that did not, the model assigns a higher predicted probability to the fire cell the vast majority of the time.
+
+The logistic regression's advantage over the random forest in this setting reflects the nature of the prediction task: much of the signal comes from large, regular patterns (season, state, and year) that are well captured by a linear model with explicit categorical indicators. The random forest's tree-based approach excels at discovering non-linear interactions, but those interactions add relatively little over and above what the fixed effects already encode, and the model requires more data to estimate them reliably within each training window.
+
+Both models degrade modestly in later validation folds (2012–2015) compared to earlier ones, which may reflect the upward trend in fire activity documented in Section 2.1.2. A model trained on data from calmer years is somewhat miscalibrated when predicting in higher-activity years which is an important limitation for operational deployment.
+
+### 5.3 Limitations and Future Directions
+
+Several limitations are worth noting. The spatial unit (U.S. state) is coarse; finer-resolution units such as counties or grid cells could better capture local fuel conditions and topographic fire risk. The predictor set is restricted to variables derivable from the fire record itself; incorporating external data, especially temperature, precipitation, drought indices, and vegetation maps, would likely produce substantially better forecasts. Finally, the 100,000-record subset used here may undersample less common fire events in low-activity states and years; using the full 188-million-record dataset could improve both predictor reliability and model stability. Despite these constraints, the results demonstrate that a disciplined, leakage-free modeling pipeline applied to publicly available data can achieve strong discrimination of notable wildfire months at the state level.
+
+
